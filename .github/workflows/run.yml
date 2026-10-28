@@ -1,0 +1,40 @@
+name: Collect FCA contacts
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "explore or collect"
+        default: "explore"
+      terms:
+        description: "Explore: one term. Collect: comma-separated search terms"
+        default: "Barclays"
+      max_firms:
+        description: "Max firms (collect mode)"
+        default: "200"
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run
+        env:
+          FCA_EMAIL: ${{ secrets.FCA_EMAIL }}
+          FCA_KEY: ${{ secrets.FCA_KEY }}
+        run: |
+          if [ "${{ inputs.mode }}" = "explore" ]; then
+            python fca_contacts.py --explore "${{ inputs.terms }}" | tee explore.txt
+          else
+            python fca_contacts.py --queries "${{ inputs.terms }}" --max-firms ${{ inputs.max_firms }} --out contacts.csv
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fca-output
+          path: |
+            contacts.csv
+            explore.txt
+          if-no-files-found: ignore
