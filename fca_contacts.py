@@ -39,26 +39,50 @@ with st.sidebar:
 # ---------- API helpers ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def api_get(url, params_json, em, key, wait):
+    """Raises RuntimeError on failure (failures are not cached)."""
     time.sleep(wait)
     params = json.loads(params_json) if params_json else None
     headers = {"X-AUTH-EMAIL": em, "X-AUTH-KEY": key, "Content-Type": "application/json"}
+    last = ""
     for attempt in range(4):
-        r = requests.get(url, params=params, headers=headers, timeout=30)
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            last = f"network error: {e}"
+            time.sleep(2)
+            continue
         if r.status_code == 429:
+            last = f"HTTP 429 rate limited | {r.url}"
             time.sleep(8 * (attempt + 1))
             continue
         if r.status_code == 404:
             return None
-        r.raise_for_status()
+        if r.status_code >= 500:
+            last = f"HTTP {r.status_code} server error | {r.url} | {r.text[:200]}"
+            if attempt >= 1:
+                break
+            time.sleep(3)
+            continue
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code} | {r.url} | {r.text[:300]}")
         try:
             return r.json()
         except ValueError:
             return None
-    return None
+    raise RuntimeError(f"Failed after retries: {last}")
+
+
+def log_error(msg):
+    st.session_state.setdefault("errlog", []).append(
+        {"time": time.strftime("%H:%M:%S"), "error": msg})
 
 
 def call(url, params=None):
-    return api_get(url, json.dumps(params) if params else "", fca_email, fca_key, delay)
+    try:
+        return api_get(url, json.dumps(params) if params else "", fca_email, fca_key, delay)
+    except Exception as e:
+        log_error(str(e))
+        return None
 
 
 def walk(obj, key=""):
@@ -93,6 +117,8 @@ def paged(url, params, limit, max_pages=60):
     items, seen = [], set()
     for page in range(1, max_pages + 1):
         data = call(url, {**params, "pgnb": page})
+        if data is None and page == 1:
+            data = call(url, params or None)  # retry without paging parameter
         batch = (data or {}).get("Data") or []
         new = []
         for i in batch:
@@ -284,23 +310,26 @@ with tab_search:
         if firsts_text.strip():
             firsts = [f.strip() for f in firsts_text.split(",") if f.strip()]
             terms = [f"{f} {t}" for t in terms for f in firsts]
-        rows = []
+        rows, summary = [], []
+        st.session_state["errlog"] = []
         bar = st.progress(0.0, text="Searching...")
-        try:
-            for ti, term in enumerate(terms):
-                rtype = "individual" if mode.startswith("Individuals") else "firm"
-                found = search(term, rtype)
-                for pi, item in enumerate(found):
-                    bar.progress((ti + (pi + 1) / max(len(found), 1)) / len(terms),
-                                 text=f"{term}: {item.get('Name', '')[:60]}")
+        for ti, term in enumerate(terms):
+            rtype = "individual" if mode.startswith("Individuals") else "firm"
+            found = search(term, rtype)
+            summary.append({"search term": term, "results found": len(found)})
+            for pi, item in enumerate(found):
+                bar.progress((ti + (pi + 1) / max(len(found), 1)) / len(terms),
+                             text=f"{term}: {item.get('Name', '')[:60]}")
+                try:
                     if mode.startswith("People"):
                         rows.extend(rows_firm_people(item, per_firm))
                     elif mode.startswith("Individuals"):
                         rows.extend(rows_individual(item))
                     else:
                         rows.extend(rows_firm(item))
-        except requests.HTTPError as e:
-            st.error(f"API error: {e}. Check your email/key.")
+                except Exception as e:
+                    log_error(f"while processing {item.get('Name', '')[:50]}: {e}")
+        st.session_state["summary"] = summary
         bar.empty()
         df_new = pd.DataFrame(rows)
         if find_site_email and not df_new.empty and "Website" in df_new.columns:
@@ -351,6 +380,22 @@ with tab_search:
                            "fca_results.csv", "text/csv")
     elif go:
         st.warning("No results found.")
+
+    summ = st.session_state.get("summary")
+    errs = st.session_state.get("errlog", [])
+    if summ:
+        with st.expander("Search summary (results per term)", expanded=bool(errs)):
+            st.dataframe(pd.DataFrame(summ), use_container_width=True, hide_index=True)
+    if errs:
+        st.error(f"{len(errs)} API error(s) occurred. Details below. The search continued with other terms.")
+        with st.expander("Error log", expanded=True):
+            elog = pd.DataFrame(errs)
+            st.dataframe(elog, use_container_width=True, hide_index=True)
+            st.download_button("Download error log", elog.to_csv(index=False).encode("utf-8"),
+                               "error_log.csv", "text/csv")
+            st.caption("HTTP 500 usually means the FCA server rejected that search (often a term that "
+                       "matches too many firms). Try a more specific term like `Financial Planning`. "
+                       "401/403 means a wrong email or key.")
 
 with tab_debug:
     st.write("See exactly what the API returns, to check which fields exist.")
