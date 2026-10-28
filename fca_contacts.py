@@ -1,4 +1,4 @@
-import json, time
+import json, re, time
 import pandas as pd
 import requests
 import streamlit as st
@@ -7,7 +7,6 @@ BASE = "https://register.fca.org.uk/services/V0.1"
 st.set_page_config(page_title="FCA Register Lookup", layout="wide")
 
 
-# ---------- credentials ----------
 def secret(name):
     try:
         return st.secrets.get(name, "")
@@ -15,13 +14,25 @@ def secret(name):
         return ""
 
 
+# ---------- optional password gate ----------
+_pw = secret("APP_PASSWORD")
+if _pw and not st.session_state.get("authed"):
+    entered = st.text_input("Password", type="password")
+    if entered:
+        if entered == _pw:
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.stop()
+
 with st.sidebar:
     st.header("Settings")
     fca_email = st.text_input("FCA API email", value=secret("FCA_EMAIL"))
     fca_key = st.text_input("FCA API key", value=secret("FCA_KEY"), type="password")
     delay = st.slider("Delay between API calls (sec)", 0.5, 3.0, 1.1, 0.1)
-    max_people = st.number_input("Max individuals per search", 1, 200, 20)
-    st.caption("Tip: on Streamlit Cloud, store these in Secrets instead of typing them.")
+    max_items = st.number_input("Max results per search term", 1, 2000, 100)
+    st.caption("Each result costs 3-6 API calls (about 1 sec each), so large searches take time.")
 
 
 # ---------- API helpers ----------
@@ -50,7 +61,6 @@ def call(url, params=None):
 
 
 def walk(obj, key=""):
-    """Yield (key, value) for every leaf in nested JSON."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             yield from walk(v, k)
@@ -66,39 +76,39 @@ def values_for(obj, needle):
                    if needle in k.lower() and str(v).strip() and not str(v).startswith("http")})
 
 
-def search(name, rtype="individual"):
+def clean_name(n):
+    return re.sub(r"\s*\(Postcode:.*\)\s*$", "", n or "").strip()
+
+
+def pick(item, *needles):
+    for n in needles:
+        for k, v in item.items():
+            if n in k.lower() and not str(v).startswith("http") and str(v).strip():
+                return str(v).strip()
+    return ""
+
+
+def paged(url, params, limit, max_pages=60):
     items, seen = [], set()
-    for page in range(1, 30):
-        data = call(f"{BASE}/Search", {"q": name, "type": rtype, "pgnb": page})
-        batch = [i for i in ((data or {}).get("Data") or []) if i.get("URL") not in seen]
-        if not batch:
-            break
+    for page in range(1, max_pages + 1):
+        data = call(url, {**params, "pgnb": page})
+        batch = (data or {}).get("Data") or []
+        new = []
         for i in batch:
-            seen.add(i.get("URL"))
-            items.append(i)
-        if len(items) >= max_people:
+            sig = json.dumps(i, sort_keys=True, default=str)
+            if sig not in seen:
+                seen.add(sig)
+                new.append(i)
+        if not new:
             break
-    return items[: int(max_people)]
+        items.extend(new)
+        if len(items) >= limit:
+            break
+    return items[: int(limit)]
 
 
-def find_firms(obj):
-    """Find (frn, name) pairs anywhere in a roles/details response."""
-    firms = {}
-    def rec(node):
-        if isinstance(node, dict):
-            frn = next((str(v) for k, v in node.items()
-                        if ("frn" in k.lower() or "firm reference" in k.lower()) and str(v).strip()), None)
-            if frn:
-                name = next((str(v) for k, v in node.items()
-                             if "name" in k.lower() and not str(v).startswith("http") and str(v).strip()), "")
-                firms[frn] = name
-            for v in node.values():
-                rec(v)
-        elif isinstance(node, list):
-            for v in node:
-                rec(v)
-    rec(obj)
-    return firms
+def search(term, rtype):
+    return paged(f"{BASE}/Search", {"q": term, "type": rtype}, max_items)
 
 
 def norm_url(raw):
@@ -119,34 +129,71 @@ def firm_contact(frn):
     }
 
 
-def lookup_firm(item):
+def firm_name(frn):
+    d = call(f"{BASE}/Firm/{frn}") or {}
+    names = values_for(d, "organisation name")
+    return names[0] if names else ""
+
+
+def firm_ids(obj):
+    """Find firm reference numbers anywhere in a response (URLs or FRN-like keys)."""
+    ids = []
+    for k, v in walk(obj):
+        sv = str(v)
+        m = re.search(r"/Firm/(\d{3,})", sv)
+        if m:
+            ids.append(m.group(1))
+        elif ("frn" in k.lower() or "firm reference" in k.lower()) and sv.strip().isdigit():
+            ids.append(sv.strip())
+    return list(dict.fromkeys(ids))
+
+
+# ---------- row builders ----------
+EMPTY_FIRM = {"Company": "", "FRN": "", "Website": "", "Email": "", "Phone": "", "Town": "", "Postcode": ""}
+
+
+def rows_individual(item):
+    url = item.get("URL", "")
+    details = call(url) or {}
+    blobs = [details]
+    follow = []
+    for k, v in walk(details):
+        if isinstance(v, str) and v.startswith("http") and "register.fca.org.uk" in v:
+            low = v.lower()
+            if "disciplinary" in low or v.split("?")[0] == url.split("?")[0]:
+                continue
+            if "/individual" in low or "role" in k.lower():
+                follow.append(v)
+    for u in list(dict.fromkeys(follow))[:4]:
+        blobs.append(call(u) or {})
+    ids = []
+    for b in blobs:
+        ids += firm_ids(b)
+    ids = list(dict.fromkeys(ids))
+    base = {"Name": item.get("Name", ""), "IRN": item.get("Reference Number", ""),
+            "Status": item.get("Status", "")}
+    if not ids:
+        return [{**base, **EMPTY_FIRM}]
+    return [{**base, "Company": firm_name(f), "FRN": f, **firm_contact(f)} for f in ids]
+
+
+def rows_firm(item):
     frn = str(item.get("Reference Number", ""))
-    return [{"Company": item.get("Name", ""), "FRN": frn,
+    return [{"Company": clean_name(item.get("Name", "")), "FRN": frn,
              "Status": item.get("Status", ""), **firm_contact(frn)}]
 
 
-def lookup_person(item):
-    url = item.get("URL", "")
-    details = call(url) or {}
-    # follow any role-related link the individual record exposes
-    role_urls = [v for k, v in walk(details) if isinstance(v, str) and v.startswith("http")
-                 and "role" in (k + v).lower()]
-    roles = [call(u) or {} for u in role_urls[:2]]
-    firms = {}
-    for blob in [details] + roles:
-        firms.update(find_firms(blob))
-    base = {
-        "Name": item.get("Name", ""),
-        "IRN": item.get("Reference Number", ""),
-        "Status": item.get("Status", ""),
-    }
-    rows = []
-    if not firms:
-        rows.append({**base, "Company": "", "FRN": "", "Website": "", "Email": "",
-                     "Phone": "", "Town": "", "Postcode": ""})
-    for frn, fname in firms.items():
-        rows.append({**base, "Company": fname, "FRN": frn, **firm_contact(frn)})
-    return rows
+def rows_firm_people(item, per_firm):
+    frn = str(item.get("Reference Number", ""))
+    company = clean_name(item.get("Name", ""))
+    contact = firm_contact(frn)
+    people = paged(f"{BASE}/Firm/{frn}/Individuals", {}, per_firm, max_pages=20)
+    if not people:
+        return [{"Name": "", "IRN": "", "Status": item.get("Status", ""),
+                 "Company": company, "FRN": frn, **contact}]
+    return [{"Name": pick(p, "name"), "IRN": pick(p, "irn", "reference"),
+             "Status": pick(p, "status"), "Company": company, "FRN": frn, **contact}
+            for p in people]
 
 
 # ---------- UI ----------
@@ -154,25 +201,51 @@ st.title("FCA Register lookup")
 tab_search, tab_debug = st.tabs(["Search", "Raw API viewer"])
 
 with tab_search:
-    mode = st.radio("Search for", ["Individuals", "Firms"], horizontal=True)
-    names = st.text_area("One search term per line",
-                         placeholder="John Smith\nJane Doe" if mode == "Individuals"
-                         else "insurance broker\nmortgage\nWealth management", height=110)
+    mode = st.radio("Search for",
+                    ["People at firms (largest pool)", "Individuals by name", "Firms"],
+                    horizontal=True)
+    if mode.startswith("People"):
+        st.caption("Type firm keywords (e.g. `insurance broker`, `mortgage`, `wealth`, a town). "
+                   "For each firm found, the app lists its approved people with company, website, "
+                   "email and phone filled in.")
+        per_firm = st.number_input("Max people per firm", 1, 500, 25)
+    elif mode.startswith("Individuals"):
+        st.caption("One term per line. A surname alone may return nothing, so you can combine with first names below.")
+        per_firm = 0
+    else:
+        per_firm = 0
+
+    terms_text = st.text_area("One search term per line", height=110)
+    firsts_text = ""
+    if mode.startswith("Individuals"):
+        firsts_text = st.text_input("Optional: first names to combine with every line (comma-separated)",
+                                    placeholder="John, David, Sarah, Michael")
+
     ready = bool(fca_email and fca_key)
     if not ready:
         st.info("Add your FCA API email and key in the sidebar.")
     go = st.button("Search", type="primary", disabled=not ready)
 
-    if go and names.strip():
-        rows, terms = [], [n.strip() for n in names.splitlines() if n.strip()]
+    if go and terms_text.strip():
+        terms = [t.strip() for t in terms_text.splitlines() if t.strip()]
+        if firsts_text.strip():
+            firsts = [f.strip() for f in firsts_text.split(",") if f.strip()]
+            terms = [f"{f} {t}" for t in terms for f in firsts]
+        rows = []
         bar = st.progress(0.0, text="Searching...")
         try:
             for ti, term in enumerate(terms):
-                found = search(term, "individual" if mode == "Individuals" else "firm")
+                rtype = "individual" if mode.startswith("Individuals") else "firm"
+                found = search(term, rtype)
                 for pi, item in enumerate(found):
                     bar.progress((ti + (pi + 1) / max(len(found), 1)) / len(terms),
-                                 text=f"{term}: {item.get('Name', '')}")
-                    rows.extend(lookup_person(item) if mode == "Individuals" else lookup_firm(item))
+                                 text=f"{term}: {item.get('Name', '')[:60]}")
+                    if mode.startswith("People"):
+                        rows.extend(rows_firm_people(item, per_firm))
+                    elif mode.startswith("Individuals"):
+                        rows.extend(rows_individual(item))
+                    else:
+                        rows.extend(rows_firm(item))
         except requests.HTTPError as e:
             st.error(f"API error: {e}. Check your email/key.")
         bar.empty()
@@ -181,14 +254,18 @@ with tab_search:
     df = st.session_state.get("df")
     if df is not None and not df.empty:
         c1, c2, c3, c4, c5 = st.columns(5)
+        only_company = c1.checkbox("Only with company")
         only_web = c1.checkbox("Only with website")
         only_email = c2.checkbox("Only with email")
         only_phone = c3.checkbox("Only with phone")
         status_opts = sorted(x for x in df["Status"].dropna().unique() if x)
-        status_sel = c4.multiselect("Status", status_opts, default=status_opts)
+        default_status = [s for s in status_opts if s.lower() in ("active", "registered", "authorised")] or status_opts
+        status_sel = c4.multiselect("Status", status_opts, default=default_status)
         company_q = c5.text_input("Company contains")
 
         f = df.copy()
+        if only_company:
+            f = f[f["Company"].astype(bool)]
         if only_web:
             f = f[f["Website"].astype(bool)]
         if only_email:
@@ -214,15 +291,23 @@ with tab_search:
 
 with tab_debug:
     st.write("See exactly what the API returns, to check which fields exist.")
-    q = st.text_input("Search term", "")
+    ready = bool(fca_email and fca_key)
+    irn = st.text_input("Individual: paste the URL from a search result, or search a name")
+    q = st.text_input("Or search term", "")
     kind = st.selectbox("Type", ["individual", "firm"])
-    if st.button("Show raw result") and q and fca_email and fca_key:
-        for r in search(q, kind)[:3]:
-            st.json(r)
-            st.json(call(r.get("URL", "")) or {})
-
+    if st.button("Show raw result") and ready and (q or irn):
+        res = search(q, kind)[:2] if q else [{"URL": irn}]
+        for r in res:
+            st.write("Search item"); st.json(r)
+            d = call(r.get("URL", "")) or {}
+            st.write("Detail record"); st.json(d)
+            for k, v in walk(d):
+                if isinstance(v, str) and v.startswith("http") and "disciplinary" not in v.lower():
+                    st.write(f"Linked: {k}")
+                    st.json(call(v) or {})
+                    break
     st.divider()
-    st.write("Check a firm by FRN (e.g. a firm where you can see an email on the register page):")
-    frn_in = st.text_input("FRN", "")
-    if st.button("Show raw Address data") and frn_in.strip() and fca_email and fca_key:
+    frn_in = st.text_input("Check a firm by FRN")
+    if st.button("Show raw firm Address + Individuals") and frn_in.strip() and ready:
         st.json(call(f"{BASE}/Firm/{frn_in.strip()}/Address") or {})
+        st.json(call(f"{BASE}/Firm/{frn_in.strip()}/Individuals") or {})
