@@ -57,6 +57,8 @@ def api_get(url, params_json, em, key, wait):
             continue
         if r.status_code == 404:
             return None
+        if r.status_code >= 500 and "Too many query rows" in r.text:
+            raise RuntimeError(f"Term too broad (FCA limit: over 50,000 matches) | {r.url}")
         if r.status_code >= 500:
             last = f"HTTP {r.status_code} server error | {r.url} | {r.text[:200]}"
             if attempt >= 1:
@@ -113,11 +115,16 @@ def pick(item, *needles):
     return ""
 
 
+def too_broad_since(n):
+    return any("too broad" in e["error"] for e in st.session_state.get("errlog", [])[n:])
+
+
 def paged(url, params, limit, max_pages=60):
+    n_before = len(st.session_state.get("errlog", []))
     items, seen = [], set()
     for page in range(1, max_pages + 1):
         data = call(url, {**params, "pgnb": page})
-        if data is None and page == 1:
+        if data is None and page == 1 and not too_broad_since(n_before):
             data = call(url, params or None)  # retry without paging parameter
         batch = (data or {}).get("Data") or []
         new = []
@@ -134,8 +141,25 @@ def paged(url, params, limit, max_pages=60):
     return items[: int(limit)]
 
 
-def search(term, rtype):
-    return paged(f"{BASE}/Search", {"q": term, "type": rtype}, max_items)
+NARROW_DEFAULT = ("Planning, Services, Management, Advisers, Advisory, Solutions, Group, Partners, "
+                  "Associates, Consultants, Wealth, Mortgage, Independent, Insurance, Investment, "
+                  "Pensions, Capital, Limited, LLP")
+
+
+def search(term, rtype, narrow_words=None):
+    n0 = len(st.session_state.get("errlog", []))
+    items = paged(f"{BASE}/Search", {"q": term, "type": rtype}, max_items)
+    if not items and narrow_words and too_broad_since(n0):
+        seen, out = set(), []
+        for w in narrow_words:
+            if len(out) >= max_items:
+                break
+            for it in paged(f"{BASE}/Search", {"q": f"{term} {w}", "type": rtype}, max_items - len(out)):
+                if it.get("URL") not in seen:
+                    seen.add(it.get("URL"))
+                    out.append(it)
+        items = out
+    return items
 
 
 def norm_url(raw):
@@ -296,6 +320,11 @@ with tab_search:
         firsts_text = st.text_input("Optional: first names to combine with every line (comma-separated)",
                                     placeholder="John, David, Sarah, Michael")
 
+    auto_narrow = st.checkbox("Auto-narrow terms that are too broad (adds extra words)", value=True,
+                              help="If the FCA says a term matches over 50,000 records, the app retries "
+                                   "it combined with each word below.")
+    narrow_text = st.text_input("Words to add when a term is too broad", NARROW_DEFAULT) if auto_narrow else ""
+    narrow_words = [w.strip() for w in narrow_text.split(",") if w.strip()]
     find_site_email = st.checkbox(
         "Also look for a contact email on each firm's own website (slower)",
         help="Visits the firm's home/contact page and collects emails on the firm's own domain. "
@@ -315,7 +344,7 @@ with tab_search:
         bar = st.progress(0.0, text="Searching...")
         for ti, term in enumerate(terms):
             rtype = "individual" if mode.startswith("Individuals") else "firm"
-            found = search(term, rtype)
+            found = search(term, rtype, narrow_words)
             summary.append({"search term": term, "results found": len(found)})
             for pi, item in enumerate(found):
                 bar.progress((ti + (pi + 1) / max(len(found), 1)) / len(terms),
