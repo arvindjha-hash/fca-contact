@@ -1,4 +1,5 @@
 import json, re, time
+import urllib.parse, urllib.robotparser
 import pandas as pd
 import requests
 import streamlit as st
@@ -148,6 +149,54 @@ def firm_ids(obj):
     return list(dict.fromkeys(ids))
 
 
+# ---------- optional: published contact email from a firm's own website ----------
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+FILE_EXT = {"png", "jpg", "jpeg", "gif", "svg", "webp", "css", "js", "woff", "woff2"}
+SOCIAL = ("facebook.", "linkedin.", "twitter.", "instagram.", "x.com", "youtube.")
+UA = {"User-Agent": "Mozilla/5.0 (compatible; FCA-contact-lookup; polite single-page fetch)"}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def site_emails(site_url):
+    """Look for a published email on the firm's own domain (home + contact pages). Respects robots.txt."""
+    if not site_url:
+        return ""
+    p = urllib.parse.urlparse(site_url)
+    host = p.netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    if not host or any(sn in host for sn in SOCIAL):
+        return ""
+    root = f"{p.scheme}://{p.netloc}"
+    rp = urllib.robotparser.RobotFileParser()
+    try:
+        r = requests.get(root + "/robots.txt", timeout=8, headers=UA)
+        rp.parse(r.text.splitlines() if r.ok else [])
+    except Exception:
+        rp.parse([])
+    found = []
+    for path in ["", "/contact", "/contact-us", "/contact.html", "/about-us"]:
+        url = root + path
+        try:
+            if not rp.can_fetch("*", url):
+                continue
+            r = requests.get(url, timeout=8, headers=UA)
+        except Exception:
+            continue
+        if not r.ok or "html" not in r.headers.get("content-type", ""):
+            continue
+        for m in EMAIL_RE.findall(r.text[:600000]):
+            e = m.lower().strip(".")
+            dom = e.split("@")[1]
+            if e.rsplit(".", 1)[-1] in FILE_EXT:
+                continue
+            if (dom == host or dom.endswith("." + host) or host.endswith("." + dom)) and e not in found:
+                found.append(e)
+        if found:
+            break
+        time.sleep(0.5)
+    return "; ".join(found[:3])
+
+
 # ---------- row builders ----------
 EMPTY_FIRM = {"Company": "", "FRN": "", "Website": "", "Email": "", "Phone": "", "Town": "", "Postcode": ""}
 
@@ -221,6 +270,10 @@ with tab_search:
         firsts_text = st.text_input("Optional: first names to combine with every line (comma-separated)",
                                     placeholder="John, David, Sarah, Michael")
 
+    find_site_email = st.checkbox(
+        "Also look for a contact email on each firm's own website (slower)",
+        help="Visits the firm's home/contact page and collects emails on the firm's own domain. "
+             "These are the firm's published business contacts, not personal emails.")
     ready = bool(fca_email and fca_key)
     if not ready:
         st.info("Add your FCA API email and key in the sidebar.")
@@ -249,7 +302,17 @@ with tab_search:
         except requests.HTTPError as e:
             st.error(f"API error: {e}. Check your email/key.")
         bar.empty()
-        st.session_state["df"] = pd.DataFrame(rows)
+        df_new = pd.DataFrame(rows)
+        if find_site_email and not df_new.empty and "Website" in df_new.columns:
+            sites = [w for w in df_new["Website"].unique() if w]
+            sbar = st.progress(0.0, text="Checking firm websites...")
+            mapping = {}
+            for i, w in enumerate(sites):
+                mapping[w] = site_emails(w)
+                sbar.progress((i + 1) / len(sites), text=f"Checking {w[:60]}")
+            sbar.empty()
+            df_new["Email"] = df_new.apply(lambda r: r["Email"] or mapping.get(r["Website"], ""), axis=1)
+        st.session_state["df"] = df_new
 
     df = st.session_state.get("df")
     if df is not None and not df.empty:
