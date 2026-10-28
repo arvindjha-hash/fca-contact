@@ -112,6 +112,7 @@ def firm_contact(frn):
     addr = call(f"{BASE}/Firm/{frn}/Address") or {}
     return {
         "Website": norm_url("; ".join(values_for(addr, "website"))),
+        "Email": "; ".join(values_for(addr, "email")),
         "Phone": "; ".join(values_for(addr, "phone")),
         "Town": "; ".join(values_for(addr, "town")),
         "Postcode": "; ".join(values_for(addr, "postcode")),
@@ -141,8 +142,8 @@ def lookup_person(item):
     }
     rows = []
     if not firms:
-        rows.append({**base, "Company": "", "FRN": "", "Website": "", "Phone": "",
-                     "Town": "", "Postcode": ""})
+        rows.append({**base, "Company": "", "FRN": "", "Website": "", "Email": "",
+                     "Phone": "", "Town": "", "Postcode": ""})
     for frn, fname in firms.items():
         rows.append({**base, "Company": fname, "FRN": frn, **firm_contact(frn)})
     return rows
@@ -179,16 +180,19 @@ with tab_search:
 
     df = st.session_state.get("df")
     if df is not None and not df.empty:
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         only_web = c1.checkbox("Only with website")
-        only_phone = c2.checkbox("Only with phone")
+        only_email = c2.checkbox("Only with email")
+        only_phone = c3.checkbox("Only with phone")
         status_opts = sorted(x for x in df["Status"].dropna().unique() if x)
-        status_sel = c3.multiselect("Status", status_opts, default=status_opts)
-        company_q = c4.text_input("Company contains")
+        status_sel = c4.multiselect("Status", status_opts, default=status_opts)
+        company_q = c5.text_input("Company contains")
 
         f = df.copy()
         if only_web:
             f = f[f["Website"].astype(bool)]
+        if only_email:
+            f = f[f["Email"].astype(bool)]
         if only_phone:
             f = f[f["Phone"].astype(bool)]
         if status_sel:
@@ -216,3 +220,9 @@ with tab_debug:
         for r in search(q, kind)[:3]:
             st.json(r)
             st.json(call(r.get("URL", "")) or {})
+
+    st.divider()
+    st.write("Check a firm by FRN (e.g. a firm where you can see an email on the register page):")
+    frn_in = st.text_input("FRN", "")
+    if st.button("Show raw Address data") and frn_in.strip() and fca_email and fca_key:
+        st.json(call(f"{BASE}/Firm/{frn_in.strip()}/Address") or {})
